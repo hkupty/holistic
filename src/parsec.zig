@@ -1,11 +1,10 @@
 const std = @import("std");
 const mem = std.mem;
 const testing = std.testing;
-const string = []const u8;
 
 const HLSFieldSpec = struct {
     field: HLSField,
-    spec: string,
+    spec: []const u8,
 };
 
 const HLSField = enum {
@@ -30,10 +29,10 @@ const ParseResult = union(enum) {
 };
 
 const ConstParser = struct {
-    data: string,
+    data: []const u8,
     field: ?HLSField = null,
 
-    fn parse(self: *const ConstParser, input: string) ParseError!ParseResult {
+    fn parse(self: *const ConstParser, input: []const u8) ParseError!ParseResult {
         if (self.data.len > input.len) {
             return ParseError.Mismatch;
         }
@@ -61,7 +60,7 @@ const ConstParser = struct {
 const OptionParser = struct {
     options: []const Parser,
 
-    fn parse(self: *const OptionParser, input: string) ParseError!ParseResult {
+    fn parse(self: *const OptionParser, input: []const u8) ParseError!ParseResult {
         for (self.options) |p| {
             return p.parse(input) catch |err| {
                 switch (err) {
@@ -81,7 +80,7 @@ const OptionParser = struct {
 const SequenceParser = struct {
     sequence: []const Parser,
 
-    fn parse(self: *const SequenceParser, input: string) ParseError!ParseResult {
+    fn parse(self: *const SequenceParser, input: []const u8) ParseError!ParseResult {
         var data = input;
         for (self.sequence) |p| {
             const parsed = try p.parse(data);
@@ -108,7 +107,7 @@ const Parser = union(enum) {
     option: OptionParser,
     sequence: SequenceParser,
 
-    pub fn parse(self: Parser, input: string) ParseError!ParseResult {
+    pub fn parse(self: Parser, input: []const u8) ParseError!ParseResult {
         switch (self) {
             inline else => |impl| return impl.parse(input),
         }
