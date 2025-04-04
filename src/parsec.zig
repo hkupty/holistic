@@ -1,7 +1,9 @@
+// This is the first attempt and will be discarded in favor of parsers.zig
 const std = @import("std");
 const mem = std.mem;
 const math = std.math;
 const testing = std.testing;
+const time = std.time;
 
 const HLSFieldSpec = struct {
     field: HLSField,
@@ -22,6 +24,7 @@ const ParseError = error{
     /// Returned when the input doesn't match the parser expectations
     Mismatch,
     Unfinished,
+    Unsupported,
 };
 
 const ParserBuildError = error{CannotFindDifference};
@@ -44,7 +47,6 @@ const ConstParser = struct {
         const ref = input[0..self.data.len];
 
         if (!mem.eql(u8, self.data, ref)) {
-            std.debug.print("string {s} doesn't match {s}\n", .{ ref, self.data });
             return ParseError.Mismatch;
         } else {
             const remaining = input[self.data.len..input.len];
@@ -83,8 +85,17 @@ const OptionParser = struct {
     }
 };
 
+fn resolve_data(parser: *const Parser) ParseError![]const u8 {
+    return switch (parser.*) {
+        .cnst => |p| p.data,
+        .sequence => |p| resolve_data(&p.sequence[0]),
+        else => ParseError.Unsupported,
+    };
+}
+
 const MappedOptionParser = struct {
-    options: []const ?*const ConstParser,
+    alloc: *const std.mem.Allocator,
+    options: []const ?*const Parser,
     mask: u8,
     shift: u3,
 
@@ -100,7 +111,11 @@ const MappedOptionParser = struct {
         return p.parse(input);
     }
 
-    fn build(allocator: *const std.mem.Allocator, comptime parsers: []const *const ConstParser) !MappedOptionParser {
+    fn deinit(self: *const MappedOptionParser) void {
+        self.alloc.free(self.options);
+    }
+
+    fn build(allocator: *const std.mem.Allocator, comptime parsers: []const *const Parser) !MappedOptionParser {
         const window = comptime math.log2_int(usize, parsers.len);
         const mask: u8 = (1 << window) - 1;
         comptime var shift: u3 = 0;
@@ -108,9 +123,11 @@ const MappedOptionParser = struct {
         maskshift: inline while (shift <= (8 - window)) : (shift += 1) {
             inline for (0..parsers.len - 1) |i| {
                 inner: {
-                    const i_key = (parsers[i].data[0] >> shift) & mask;
+                    const data_i = try comptime resolve_data(parsers[i]);
+                    const i_key = (data_i[0] >> shift) & mask;
                     inline for (i + 1..parsers.len) |j| {
-                        const j_key = (parsers[j].data[0] >> shift) & mask;
+                        const data_j = try comptime resolve_data(parsers[j]);
+                        const j_key = (data_j[0] >> shift) & mask;
                         if (i_key == j_key) {
                             break :inner;
                         }
@@ -121,17 +138,18 @@ const MappedOptionParser = struct {
             }
         }
 
-        const parsermap = try allocator.alloc(?*const ConstParser, mask + 1);
+        const parsermap = try allocator.alloc(?*const Parser, mask + 1);
         @memset(parsermap, null);
 
         inline for (parsers) |p| {
-            const index = (p.data[0] >> shift) & mask;
-            std.debug.print("Assigning {s} parser to index {X}\n", .{ p.data, index });
-            const holder: ?*const ConstParser = p;
+            const key = try resolve_data(p);
+            const index = (key[0] >> shift) & mask;
+            std.debug.print("Assigning {s} parser to index {X}\n", .{ key, index });
+            const holder: ?*const Parser = p;
             parsermap[index] = holder;
         }
 
-        return .{ .options = parsermap, .mask = mask, .shift = shift };
+        return .{ .alloc = allocator, .options = parsermap, .mask = mask, .shift = shift };
     }
 
     pub fn parser(self: MappedOptionParser) Parser {
@@ -223,7 +241,8 @@ test "Mapped options parser" {
     const inf = ConstParser{ .data = "INF", .field = HLSField.EXTINF };
 
     std.debug.print("Parser addresses are {*} and {*}\n", .{ &m3u, &inf });
-    const select = try MappedOptionParser.build(&testing.allocator, &.{ &m3u, &inf });
+    const select = try MappedOptionParser.build(&testing.allocator, &.{ &m3u.parser(), &inf.parser() });
+    defer select.deinit();
     const complete = SequenceParser{ .sequence = &.{ prefix.parser(), select.parser() } };
 
     var parsed = try complete.parse("#EXTM3U");
@@ -245,3 +264,95 @@ test "Error cases" {
     try testing.expectError(ParseError.Mismatch, ext.parse("#RXT"));
     try testing.expectError(ParseError.Unfinished, ext.parse("#EXT"));
 }
+
+fn bench_parser(name: []const u8, parser: *const Parser, data: []const u8, comptime max_loops: usize) !void {
+    var timer = try time.Timer.start();
+    var measurements: [max_loops]u64 = [_]u64{0} ** max_loops;
+
+    var loops: usize = 0;
+
+    while (loops < max_loops) : (loops += 1) {
+        defer measurements[loops] = timer.lap();
+        _ = try parser.parse(data);
+    }
+
+    var smaller = measurements[0];
+    var bigger = measurements[0];
+    var sum: u64 = 0;
+
+    std.mem.sort(u64, &measurements, {}, comptime std.sort.asc(u64));
+
+    for (measurements) |run| {
+        if (run > bigger) {
+            bigger = run;
+        }
+        if (run < smaller) {
+            smaller = run;
+        }
+        sum += run;
+    }
+    const mgn = std.math.log10(sum);
+    const total = sum / std.math.pow(u64, 10, mgn - 1);
+
+    const p50ix = comptime @ceil(0.5 * @as(f32, max_loops));
+    const p90ix = comptime @ceil(0.9 * @as(f32, max_loops));
+    const p99ix = comptime @ceil(0.99 * @as(f32, max_loops));
+
+    const unit = switch (mgn) {
+        1 => "ns",
+        2 => "ns",
+        3 => "ns",
+        4 => "us",
+        5 => "us",
+        6 => "us",
+        7 => "ms",
+        8 => "ms",
+        9 => "ms",
+        else => "s",
+    };
+
+    std.debug.print("{s}: {d} loops\n", .{ name, loops });
+    std.debug.print(" min   {d} ns/op\n", .{smaller});
+    std.debug.print(" max   {d} ns/op\n", .{bigger});
+    std.debug.print(" avg   {d} ns/op\n", .{sum / loops});
+    std.debug.print(" p50   {d} ns/op\n", .{measurements[p50ix]});
+    std.debug.print(" p90   {d} ns/op\n", .{measurements[p90ix]});
+    std.debug.print(" p99   {d} ns/op\n", .{measurements[p99ix]});
+    std.debug.print(" total {d} {s}\n", .{ total, unit });
+}
+
+test "Benchmark parsers" {
+    const prefix = ConstParser{ .data = "#EXT" };
+    const m3u = ConstParser{ .data = "M3U", .field = HLSField.EXTM3U };
+    const inf = ConstParser{ .data = "INF", .field = HLSField.EXTINF };
+    const x = ConstParser{ .data = "-X-", .field = HLSField.EXTINF };
+    const discontinuity = ConstParser{ .data = "DISCONTINUITY", .field = HLSField.EXTINF };
+    const byterange = ConstParser{ .data = "BYTERANGE", .field = HLSField.EXTINF };
+    const vers = ConstParser{ .data = "VERSION", .field = HLSField.EXTINF };
+
+    const suffix_options = OptionParser{ .options = &.{ discontinuity.parser(), byterange.parser(), vers.parser() } };
+    const suffix = SequenceParser{ .sequence = &.{ x.parser(), suffix_options.parser() } };
+    const options = OptionParser{ .options = &.{ m3u.parser(), inf.parser(), suffix.parser() } };
+
+    const option = SequenceParser{ .sequence = &.{ prefix.parser(), options.parser() } };
+
+    const m_suffix_options = try MappedOptionParser.build(&testing.allocator, &.{ &discontinuity.parser(), &byterange.parser(), &vers.parser() });
+    defer m_suffix_options.deinit();
+    const m_suffix = SequenceParser{ .sequence = &.{ x.parser(), m_suffix_options.parser() } };
+    const m_options = try MappedOptionParser.build(&testing.allocator, &.{ &m3u.parser(), &inf.parser(), &m_suffix.parser() });
+    defer m_options.deinit();
+
+    const mapped_option = SequenceParser{ .sequence = &.{ prefix.parser(), m_options.parser() } };
+
+    try bench_parser("select", &option.parser(), "#EXT-X-VERSION", 10_000);
+    try bench_parser("multi_select", &mapped_option.parser(), "#EXT-X-VERSION", 10_000);
+}
+
+// select: 10000 loops
+//  min   360 ns/op
+//  max   11882 ns/op
+//  avg   430 ns/op
+//  p50   421 ns/op
+//  p90   451 ns/op
+//  p99   491 ns/op
+//  total 43 us
