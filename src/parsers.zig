@@ -34,35 +34,94 @@ const ParserError = error{
     Unsupported,
 
     /// Failed to process due to other errors
-    Failure,
+    ParserBuildError,
 };
 
+const ParseResultMapper = struct {
+    map: *const fn (ParseResult) ParserError!ParseResult,
+
+    const identity: ParseResultMapper = .{ .map = struct {
+        fn identity(state: ParseResult) ParserError!ParseResult {
+            return state;
+        }
+    }.identity };
+};
+
+fn debugParser(parser: Parser) void {
+    switch (parser) {
+        .str => |s| std.debug.print("String[{s}]\n", .{s.ref}),
+        .seq => |s| {
+            std.debug.print("Sequence[\n", .{});
+            for (s.inner) |p| {
+                std.debug.print("  ", .{});
+                debugParser(p);
+            }
+            std.debug.print("]\n", .{});
+        },
+        .sel => |s| {
+            std.debug.print("Select[\n", .{});
+            for (s.inner) |p| {
+                if (p == null) {
+                    continue;
+                }
+                std.debug.print("  ", .{});
+                debugParser(p.?);
+            }
+            std.debug.print("]\n", .{});
+        },
+    }
+}
+
+/// A parser that delegates the execution to two or more parsers
 const SequenceParser = struct {
     inner: []const Parser,
+    handler: ParseResultMapper = .identity,
 
-    fn parse(self: *const SequenceParser, state: ParserState) ParserError!ParserState {
+    fn parse(self: SequenceParser, state: ParserState) ParserError!ParserState {
         var stateCursor = state;
         for (self.inner) |parser| {
             stateCursor = try parser.parse(stateCursor);
         }
 
-        return stateCursor;
+        return .{ .buffer = stateCursor.buffer, .output = try self.handler.map(stateCursor.output) };
     }
 
     fn flatConcat(comptime left: Parser, comptime right: Parser) SequenceParser {
-        var inner: []const Parser = undefined;
+        const inner = comptime resolve: {
+            const sz = switch (left) {
+                .seq => |l| l.inner.len,
+                inline else => 1,
+            } + switch (right) {
+                .seq => |r| r.inner.len,
+                inline else => 1,
+            };
 
-        comptime switch (left) {
-            .seq => |seq| inner = seq.inner,
-            inline else => [_]Parser{left},
+            var inner: [sz]Parser = undefined;
+            var ix = 0;
+            switch (left) {
+                .seq => |s| for (s.inner) |p| {
+                    inner[ix] = p;
+                    ix += 1;
+                },
+                inline else => {
+                    inner[ix] = left;
+                    ix += 1;
+                },
+            }
+            switch (right) {
+                .seq => |s| for (s.inner) |p| {
+                    inner[ix] = p;
+                    ix += 1;
+                },
+                inline else => {
+                    inner[ix] = right;
+                    ix += 1;
+                },
+            }
+
+            break :resolve inner;
         };
-
-        comptime switch (right) {
-            .seq => |seq| inner = inner ++ seq.inner,
-            inline else => inner = inner ++ [_]Parser{right},
-        };
-
-        return .{ .inner = inner };
+        return .{ .inner = &inner };
     }
 
     fn concat(self: *const SequenceParser, comptime other: Parser) Parser {
@@ -71,8 +130,21 @@ const SequenceParser = struct {
             inline else => .{ .seq = .{ .inner = self.inner ++ [_]Parser{other} } },
         };
     }
+
+    fn peek(self: SequenceParser) ?u8 {
+        return self.inner[0].peek();
+    }
+
+    fn headRef(self: SequenceParser) []const u8 {
+        return switch (self.inner[0]) {
+            .str => |p| p.ref,
+            .seq => |p| p.headRef(),
+            inline else => unreachable,
+        };
+    }
 };
 
+/// A parser that matches against a constant string
 const StringParser = struct {
     ref: []const u8,
 
@@ -83,27 +155,105 @@ const StringParser = struct {
 
         const target = state.buffer[0..self.ref.len];
 
-        if (!mem.eql(u8, self.ref, target)) {
-            return ParserError.Mismatch;
-        } else {
+        if (mem.eql(u8, self.ref, target)) {
             return .{
                 .buffer = state.buffer[self.ref.len..state.buffer.len],
                 .output = .{ .bin = self.ref },
             };
+        } else {
+            // std.debug.print("Got {s} but it doesn't match {s}\n", .{ target, self.ref });
+            return ParserError.Mismatch;
         }
     }
 
-    fn concat(self: *const StringParser, comptime other: Parser) Parser {
+    fn concat(self: StringParser, comptime other: Parser) Parser {
         return comptime switch (other) {
             .str => |str| .{ .str = .{ .ref = self.ref ++ str.ref } },
-            inline else => .{ .seq = SequenceParser.flatConcat(self, other) },
+            inline else => .{ .seq = SequenceParser.flatConcat(.{ .str = self }, other) },
         };
+    }
+
+    fn peek(self: *const StringParser) ?u8 {
+        return self.ref[0];
+    }
+};
+
+const SelectParser = struct {
+    shift: u3,
+    mask: u8,
+    inner: []const ?Parser,
+
+    fn parse(self: SelectParser, state: ParserState) ParserError!ParserState {
+        const index = (state.buffer[0] >> self.shift) & self.mask;
+        const parser = self.inner[index] orelse return ParserError.Mismatch;
+
+        return parser.parse(state);
+    }
+
+    fn concat(self: *const SelectParser, comptime other: Parser) Parser {
+        return buildFrom(self.inner ++ other);
+    }
+
+    fn peek(_: *const SelectParser) ?u8 {
+        return null;
+    }
+
+    inline fn buildFrom(comptime parsers: []const Parser) ParserError!SelectParser {
+        comptime if (parsers.len == 0) {
+            return ParserError.ParserBuildError;
+        };
+        comptime var buffer: [parsers.len:0]u8 = undefined;
+        @memset(&buffer, 0);
+        inline for (parsers, 0..) |p, ix| {
+            const chr = comptime p.peek() orelse return ParserError.ParserBuildError;
+            inline for (buffer) |b| {
+                if (chr == b) {
+                    return ParserError.ParserBuildError;
+                }
+            }
+            buffer[ix] = chr;
+        }
+
+        const window = comptime math.log2_int_ceil(usize, parsers.len);
+        const mask: u8 = (1 << window) - 1;
+        comptime var shift: u3 = 0;
+
+        const selectParsers: [1 << window]?Parser = comptime build: {
+            var parserArray: [1 << window]?Parser = undefined;
+
+            while (shift <= (8 - window)) : (shift += 1) {
+                for (0..parsers.len - 1) |i| {
+                    @memset(&parserArray, null);
+
+                    inner: {
+                        const data_i = parsers[i].peek().?;
+                        const i_key = (data_i >> shift) & mask;
+                        parserArray[i_key] = parsers[i];
+                        for (i + 1..parsers.len) |j| {
+                            const data_j = parsers[j].peek().?;
+                            const j_key = (data_j >> shift) & mask;
+                            parserArray[j_key] = parsers[j];
+                            if (i_key == j_key) {
+                                break :inner;
+                            }
+                        }
+
+                        break :build parserArray;
+                    }
+                }
+            }
+
+            unreachable;
+        };
+
+        return .{ .shift = shift, .mask = mask, .inner = &selectParsers };
     }
 };
 
 const Parser = union(enum) {
     str: StringParser,
     seq: SequenceParser,
+    sel: SelectParser,
 
     pub fn parseRaw(self: Parser, input: []const u8) ParserError!ParserState {
         const initialState = ParserState{ .buffer = input, .output = ParseResult.empty };
@@ -123,11 +273,26 @@ const Parser = union(enum) {
         };
     }
 
+    fn peek(self: Parser) ?u8 {
+        return switch (self) {
+            inline else => |p| p.peek(),
+        };
+    }
+
+    fn ref(self: Parser) []const u8 {
+        return switch (self) {
+            .seq => |seq| seq.headRef(),
+            .str => |str| str.ref,
+            inline else => unreachable,
+        };
+    }
+
     pub fn split(comptime self: Parser, comptime ix: usize) ParserError![2]Parser {
         comptime switch (self) {
             .seq => unreachable, // TODO: Implement
+            .sel => unreachable, // TODO: Implement
             .str => |strParser| if (ix > strParser.ref.len) {
-                return ParserError.Failure;
+                return ParserError.ParserBuildError;
             } else {
                 return [_]Parser{
                     .{ .str = .{ .ref = strParser.ref[0..ix] } },
@@ -138,8 +303,8 @@ const Parser = union(enum) {
     }
 
     /// Produces a new parser of type `StringParser` which will match against the supplied `ref`
-    pub fn Str(comptime ref: []const u8) Parser {
-        return .{ .str = StringParser{ .ref = ref } };
+    pub fn Str(comptime str: []const u8) Parser {
+        return .{ .str = StringParser{ .ref = str } };
     }
 
     /// Produces a new Parser which could be `SequenceParser`, but if all arguments are of the same
@@ -152,6 +317,70 @@ const Parser = union(enum) {
         }
 
         return cursor;
+    }
+
+    pub fn Select(comptime parsers: []const Parser) ParserError!Parser {
+        return .{ .sel = try SelectParser.buildFrom(parsers) };
+    }
+
+    pub fn Zip(comptime parsers: []const Parser) ParserError!Parser {
+        switch (parsers.len) {
+            0 => return ParserError.ParserBuildError,
+            1 => return parsers[0],
+            else => {},
+        }
+
+        return comptime init: {
+            const headPrefix: []const u8 = switch (parsers[0]) {
+                .seq => |seq| seq.headRef(),
+                .str => |str| str.ref,
+                inline else => return ParserError.ParserBuildError, // HACK: No other parser type is supported here
+            };
+
+            var commonPrefix = headPrefix;
+
+            for (1..parsers.len) |parserIndex| {
+                const str = parsers[parserIndex].ref();
+
+                for (commonPrefix, 0..) |chr, ix| {
+                    if (chr != str[ix]) {
+                        commonPrefix = commonPrefix[0..ix];
+                        break;
+                    }
+                }
+            }
+
+            if (commonPrefix.len == 0) {
+                break :init ParserError.ParserBuildError; // Unzippable
+            }
+
+            const size = calc: {
+                var sz = 0;
+                for (parsers) |p| {
+                    if ((p.ref().len - commonPrefix.len) > 0) {
+                        sz = sz + 1;
+                    }
+                }
+                break :calc sz;
+            };
+
+            var newParsers: [size]Parser = undefined;
+            var ix = 0;
+            for (parsers) |p| {
+                if ((p.ref().len - commonPrefix.len) > 0) {
+                    switch (p) {
+                        .str => |str| newParsers[ix] = Parser.Str(str.ref[commonPrefix.len..]),
+                        inline else => unreachable, // TODO: fix sequence
+                    }
+                    ix = ix + 1;
+                }
+            }
+
+            const select = try Parser.Select(&newParsers);
+            const seq = Parser.Sequence(&.{ Parser.Str(commonPrefix), select });
+
+            break :init seq;
+        };
     }
 };
 
@@ -202,7 +431,40 @@ test "sequence on parser strings concatenate them" {
 
     const r1 = try combined.parseRaw("hello world");
 
-    try testing.expectEqualDeep(r1.output, ParseResult{ .bin = "hello world" });
+    try testing.expectEqualDeep(ParseResult{ .bin = "hello world" }, r1.output);
+}
+
+test "select parser" {
+    const p1 = comptime Parser.Str("alpha");
+    const p2 = comptime Parser.Str("beta");
+    const p3 = comptime Parser.Str("gamma");
+    const p4 = comptime Parser.Str("delta");
+    const p5 = comptime Parser.Str("eta");
+    const p6 = comptime Parser.Str("tau");
+    const px = comptime Parser.Str("epsylon");
+
+    try testing.expectError(ParserError.ParserBuildError, Parser.Select(&.{ p5, px }));
+    const select = try Parser.Select(&.{ p1, p2, p3, p4, p5, p6 });
+
+    const res1 = try select.parseRaw("alpha");
+    try testing.expectEqualDeep(ParseResult{ .bin = "alpha" }, res1.output);
+
+    const res2 = try select.parseRaw("beta");
+    try testing.expectEqualDeep(ParseResult{ .bin = "beta" }, res2.output);
+
+    try testing.expectError(ParserError.Mismatch, select.parseRaw("epsylon"));
+}
+
+test "zip parsers" {
+    const p1 = comptime Parser.Str("era");
+    const p2 = comptime Parser.Str("engine");
+
+    const zipped = try Parser.Zip(&.{ p1, p2 });
+
+    var result = try zipped.parseRaw("engine");
+    try testing.expectEqualDeep(ParseResult{ .bin = "ngine" }, result.output);
+    result = try zipped.parseRaw("era");
+    try testing.expectEqualDeep(ParseResult{ .bin = "ra" }, result.output);
 }
 
 fn bench_parser(name: []const u8, parser: *const Parser, data: []const u8, comptime max_loops: usize) !void {
