@@ -161,7 +161,7 @@ const CaptureParser = struct {
 
     fn parse(self: CaptureParser, state: ParserState) ParserError!ParserState {
         if (self.terminator.len == 0) {
-            return .{ .buffer = &.{}, .output = .{ .bin = state.buffer } };
+            return captureUntilEOL(state.buffer);
         }
 
         if (state.buffer.len == 0) {
@@ -170,7 +170,7 @@ const CaptureParser = struct {
 
         const ix = std.mem.indexOf(u8, state.buffer, self.terminator) orelse {
             return switch (self.optional) {
-                true => .{ .buffer = &.{}, .output = .{ .bin = state.buffer } },
+                true => captureUntilEOL(state.buffer),
                 false => ParserError.Mismatch,
             };
         };
@@ -182,6 +182,13 @@ const CaptureParser = struct {
         return null;
     }
 };
+
+fn captureUntilEOL(input: []const u8) ParserState {
+    // TODO: Make this windows-safe... perhaps
+    const ix = std.mem.indexOf(u8, input, "\n") orelse input.len;
+
+    return .{ .buffer = input[ix..], .output = .{ .bin = input[0..ix] } };
+}
 
 const SelectParser = struct {
     shift: u3,
