@@ -42,3 +42,21 @@ If I fail successfully, I learn something in the process;
 If I fail catastrophically, then I should take a step back, reassess, and learn with the outcome.
 
 Therefore, there's always a win hidden somewhere. The only time I lose is if I get stuck. Let's make sure this doesn't happen.
+
+
+## Where am I at and how can you (yes, you reading this) help?
+
+I have picked up a few things already and this is starting to feel natural, which is good.
+At the same time, this is a one-person journey and there's a risk I'm piling up vices, anti-patterns or suboptimal ways of solving problems.
+
+Of course you're not obliged to do anything, but I would truly appreciate if you could help me out correcting those, pointing the right direction, guidance, etc.
+
+It is a journey I'll walk on my own, but I'll be truly grateful for anyone willing to help in any way.
+
+There are a couple of "rules" I've set for this project:
+
+- I want to, as much as possible, avoid using the heap (aka allocators). Why? Because I think it is a fun challenge and it is a nice way to compartmentalize subjects - adding them in the future by refactoring will be a fun learning process;
+- It should allow for custom HLS tags, as long as they're known in compile time;
+- Performance is not the goal, but it shouldn't be neglected either.
+
+That's it. Very simple. So, beforehand, I thank you for your interest in this project and for helping me in this journey.
