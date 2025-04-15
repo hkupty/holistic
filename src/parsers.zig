@@ -110,43 +110,6 @@ const SequenceParser = struct {
         return .{ .inner = self.inner, .handler = handler };
     }
 
-    fn flatten(comptime self: SequenceParser) Parser {
-        comptime var size = self.inner.len;
-        inline for (self.inner) |parser| {
-            switch (parser) {
-                .seq => |seq| size += seq.inner.len - 1,
-                inline else => {},
-            }
-        }
-
-        comptime switch (size) {
-            0 => @compileError("Cannot flatten empty sequence parser"),
-            1 => return self.inner[0],
-            else => {},
-        };
-
-        var new: [size]Parser = undefined;
-        var ix: usize = 0;
-        inline for (self.inner) |p| {
-            switch (p) {
-                .seq => |seq| {
-                    inline for (seq.inner) |pp| {
-                        new[ix] = pp;
-                        ix += 1;
-                    }
-                },
-                else => {
-                    new[ix] = p;
-                    ix += 1;
-                },
-            }
-        }
-
-        return .{ .seq = .{ .inner = &new, .handler = self.handler } };
-    }
-
-    // --- Remove --- //
-
     fn peek(self: SequenceParser) ?u8 {
         return self.inner[0].peek();
     }
@@ -365,23 +328,6 @@ pub const Parser = union(enum) {
         };
     }
 
-    pub fn split(comptime self: Parser, comptime ix: usize) ParserError![2]Parser {
-        comptime switch (self) {
-            .seq => unreachable, // TODO: Implement
-            .sel => unreachable, // TODO: Implement
-            .cap => unreachable,
-            .rep => unreachable,
-            .str => |strParser| if (ix > strParser.ref.len) {
-                return ParserError.ParserBuildError;
-            } else {
-                return [_]Parser{
-                    .{ .str = .{ .ref = strParser.ref[0..ix], .handler = strParser.handler } },
-                    .{ .str = .{ .ref = strParser.ref[ix..], .handler = strParser.handler } },
-                };
-            },
-        };
-    }
-
     /// Produces a new parser of type `StringParser` which will match against the supplied `ref`
     pub fn Str(comptime str: []const u8) Parser {
         return .{ .str = StringParser{ .ref = str } };
@@ -408,11 +354,11 @@ pub const Parser = union(enum) {
     }
 
     pub fn Zip(comptime parsers: []const Parser) Parser {
-        switch (parsers.len) {
-            0 => return ParserError.ParserBuildError,
+        comptime switch (parsers.len) {
+            0 => @compileError("Cannot zip zero parsers"),
             1 => return parsers[0],
             else => {},
-        }
+        };
 
         return comptime init: {
             const headPrefix: []const u8 = switch (parsers[0]) {
