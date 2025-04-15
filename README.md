@@ -27,7 +27,7 @@ Consider the following HLS tags:
 #EXTINF
 ```
 
-These are three of many tags that exist in the HLS spec.
+These are some of many tags that exist in the HLS spec.
 
 Note anything similar? Well, all of them have a shared prefix. And a few of them share some sections of the tag as well.
 
