@@ -4,7 +4,20 @@ const math = std.math;
 const time = std.time;
 const hls = @import("hls.zig");
 
-pub const ParseResult = union(enum) { empty: void, bin: []const u8, hls: hls.HLSField, seq: []const ParseResult };
+/// The output of a parser
+pub const ParseResult = union(enum) {
+    /// This value should be emitted when a parser swallows the input or when the value shouldn't be usec.
+    empty: void,
+
+    /// This value represents untransformed input, just segmented according to the parser spec.
+    bin: []const u8,
+
+    /// This value represents a processed output that represents an HLS tag or a piece of data relevant to build an HLS tag.
+    hls: hls.HLSField,
+
+    /// This field represents a collection of results
+    seq: []const ParseResult,
+};
 
 pub const ParserState = struct {
     buffer: []const u8,
@@ -25,12 +38,6 @@ pub const ParserError = error{
 
     /// Failed to process due to other errors
     ParserBuildError,
-};
-
-pub const ParserBuildError = error{
-    ZeroLengthParserArray,
-    PreconditionError,
-    Unsupported,
 };
 
 pub const ParseResultMapper = struct {
@@ -75,6 +82,7 @@ pub fn debugParser(parser: Parser) void {
             std.debug.print("]\n", .{});
         },
         .cap => |s| std.debug.print("Capture[{s}]\n", .{s.terminator}),
+        .rep => |s| std.debug.print("Repeat[{!} x {d}]\n", .{ s.inner, s.times }),
     }
 }
 
@@ -102,57 +110,42 @@ const SequenceParser = struct {
         return .{ .inner = self.inner, .handler = handler };
     }
 
-    fn dropPrefix(comptime self: SequenceParser, prefix: []const u8) ParserError!SequenceParser {
-        const split = try self.inner[0].split(prefix.len);
+    fn flatten(comptime self: SequenceParser) Parser {
+        comptime var size = self.inner.len;
+        inline for (self.inner) |parser| {
+            switch (parser) {
+                .seq => |seq| size += seq.inner.len - 1,
+                inline else => {},
+            }
+        }
 
-        return .{ .inner = split[1..] ++ self.inner[1..], .handler = self.handler };
-    }
+        comptime switch (size) {
+            0 => @compileError("Cannot flatten empty sequence parser"),
+            1 => return self.inner[0],
+            else => {},
+        };
 
-    fn flatConcat(comptime left: Parser, comptime right: Parser) SequenceParser {
-        const inner = comptime resolve: {
-            const sz = switch (left) {
-                .seq => |l| l.inner.len,
-                inline else => 1,
-            } + switch (right) {
-                .seq => |r| r.inner.len,
-                inline else => 1,
-            };
-
-            var inner: [sz]Parser = undefined;
-            var ix = 0;
-            switch (left) {
-                .seq => |s| for (s.inner) |p| {
-                    inner[ix] = p;
-                    ix += 1;
+        var new: [size]Parser = undefined;
+        var ix: usize = 0;
+        inline for (self.inner) |p| {
+            switch (p) {
+                .seq => |seq| {
+                    inline for (seq.inner) |pp| {
+                        new[ix] = pp;
+                        ix += 1;
+                    }
                 },
-                inline else => {
-                    inner[ix] = left;
+                else => {
+                    new[ix] = p;
                     ix += 1;
                 },
             }
-            switch (right) {
-                .seq => |s| for (s.inner) |p| {
-                    inner[ix] = p;
-                    ix += 1;
-                },
-                inline else => {
-                    inner[ix] = right;
-                    ix += 1;
-                },
-            }
+        }
 
-            break :resolve inner;
-        };
-        // TODO: Figure out which handler to use or combine
-        return .{ .inner = &inner };
+        return .{ .seq = .{ .inner = &new, .handler = self.handler } };
     }
 
-    fn concat(self: *const SequenceParser, comptime other: Parser) Parser {
-        return comptime switch (other) {
-            .seq => |seq| .{ .seq = .{ .inner = self.inner ++ seq.inner } },
-            inline else => .{ .seq = .{ .inner = self.inner ++ [_]Parser{other} } },
-        };
-    }
+    // --- Remove --- //
 
     fn peek(self: SequenceParser) ?u8 {
         return self.inner[0].peek();
@@ -172,11 +165,7 @@ const StringParser = struct {
     ref: []const u8,
     handler: ParseResultMapper = .identity,
 
-    fn map(comptime self: StringParser, handler: ParseResultMapper) StringParser {
-        return .{ .ref = self.ref, .handler = handler };
-    }
-
-    fn parse(self: *const StringParser, state: ParserState) ParserError!ParserState {
+    fn parse(self: StringParser, state: ParserState) ParserError!ParserState {
         if (self.ref.len > state.buffer.len) {
             return ParserError.PrematureEndOfInput;
         }
@@ -194,11 +183,8 @@ const StringParser = struct {
         }
     }
 
-    fn concat(self: StringParser, comptime other: Parser) Parser {
-        return comptime switch (other) {
-            .str => |str| .{ .str = .{ .ref = self.ref ++ str.ref } },
-            inline else => .{ .seq = SequenceParser.flatConcat(.{ .str = self }, other) },
-        };
+    fn map(comptime self: StringParser, handler: ParseResultMapper) StringParser {
+        return .{ .ref = self.ref, .handler = handler };
     }
 
     fn peek(self: *const StringParser) ?u8 {
@@ -246,25 +232,21 @@ const SelectParser = struct {
         return parser.parse(state);
     }
 
-    fn concat(self: *const SelectParser, comptime other: Parser) Parser {
-        return buildFrom(self.inner ++ other);
-    }
-
     fn peek(_: *const SelectParser) ?u8 {
         return null;
     }
 
-    inline fn buildFrom(comptime parsers: []const Parser) ParserError!SelectParser {
+    inline fn buildFrom(comptime parsers: []const Parser) SelectParser {
         comptime if (parsers.len == 0) {
-            return ParserError.ParserBuildError;
+            @compileError("Cannot select between parsers if no parser is provided");
         };
         comptime var buffer: [parsers.len:0]u8 = undefined;
         @memset(&buffer, 0);
         inline for (parsers, 0..) |p, ix| {
-            const chr = comptime p.peek() orelse return ParserError.ParserBuildError;
+            const chr = comptime p.peek() orelse @compileError("No character to disambiguate");
             inline for (buffer) |b| {
                 if (chr == b) {
-                    return ParserError.ParserBuildError;
+                    @compileError("Two or more parsers clash with same character");
                 }
             }
             buffer[ix] = chr;
@@ -350,22 +332,22 @@ pub const Parser = union(enum) {
     cap: CaptureParser,
     rep: RepeatParser,
 
-    pub fn parseRaw(self: Parser, input: []const u8) ParserError!ParserState {
-        const initialState = ParserState{ .buffer = input, .output = ParseResult.empty };
+    pub fn parseRaw(self: Parser, data: []const u8) ParserError!ParserState {
+        return self.parse(.{ .buffer = data, .output = ParseResult.empty });
+    }
 
-        return self.parse(initialState);
+    pub fn map(comptime self: Parser, handler: ParseResultMapper) Parser {
+        return switch (self) {
+            .str => |p| .{ .str = p.map(handler) },
+            .seq => |p| .{ .seq = p.map(handler) },
+            .rep => |p| .{ .rep = p.map(handler) },
+            inline else => unreachable,
+        };
     }
 
     fn parse(self: Parser, input: ParserState) ParserError!ParserState {
         return switch (self) {
             inline else => |impl| impl.parse(input),
-        };
-    }
-
-    fn concat(self: Parser, other: Parser) Parser {
-        // TODO: refactor
-        return switch (self) {
-            inline else => |p| p.concat(other),
         };
     }
 
@@ -379,15 +361,6 @@ pub const Parser = union(enum) {
         return switch (self) {
             .seq => |seq| seq.headRef(),
             .str => |str| str.ref,
-            inline else => unreachable,
-        };
-    }
-
-    pub fn map(comptime self: Parser, handler: ParseResultMapper) Parser {
-        return switch (self) {
-            .str => |p| .{ .str = p.map(handler) },
-            .seq => |p| .{ .seq = p.map(handler) },
-            .rep => |p| .{ .rep = p.map(handler) },
             inline else => unreachable,
         };
     }
@@ -426,27 +399,15 @@ pub const Parser = union(enum) {
         return .{ .seq = .{ .inner = parsers } };
     }
 
-    /// Produces a new Parser which could be `SequenceParser`, but if all arguments are of the same
-    /// type, there's a chance they'll be combined to a single parser of the same type instead.
-    pub fn Sequence(comptime parsers: []const Parser) Parser {
-        comptime var cursor = parsers[0];
-        comptime var ix = 1;
-        inline while (ix < parsers.len) : (ix += 1) {
-            cursor = comptime cursor.concat(parsers[ix]);
-        }
-
-        return cursor;
-    }
-
-    pub fn Select(comptime parsers: []const Parser) ParserError!Parser {
-        return .{ .sel = try SelectParser.buildFrom(parsers) };
+    pub fn Select(comptime parsers: []const Parser) Parser {
+        return .{ .sel = SelectParser.buildFrom(parsers) };
     }
 
     pub fn Repeat(comptime parser: Parser, times: usize) Parser {
         return .{ .rep = .{ .inner = &parser, .times = times } };
     }
 
-    pub fn Zip(comptime parsers: []const Parser) ParserError!Parser {
+    pub fn Zip(comptime parsers: []const Parser) Parser {
         switch (parsers.len) {
             0 => return ParserError.ParserBuildError,
             1 => return parsers[0],
@@ -457,7 +418,7 @@ pub const Parser = union(enum) {
             const headPrefix: []const u8 = switch (parsers[0]) {
                 .seq => |seq| seq.headRef(),
                 .str => |str| str.ref,
-                inline else => return ParserError.ParserBuildError, // HACK: No other parser type is supported here
+                inline else => @compileError("Unsupported"),
             };
 
             var commonPrefix = headPrefix;
@@ -474,7 +435,7 @@ pub const Parser = union(enum) {
             }
 
             if (commonPrefix.len == 0) {
-                break :init ParserError.ParserBuildError; // Unzippable
+                @compileError("empty prefix");
             }
 
             const size = calc: {
@@ -490,26 +451,70 @@ pub const Parser = union(enum) {
             var newParsers: [size]Parser = undefined;
             var ix = 0;
             for (parsers) |p| {
-                if ((p.ref().len - commonPrefix.len) > 0) {
-                    switch (p) {
-                        .str => {
-                            const spl = p.split(commonPrefix.len) catch unreachable;
-                            newParsers[ix] = spl[1];
-                        },
-                        .seq => |seq| newParsers[ix] = .{ .seq = seq.dropPrefix(commonPrefix) catch unreachable },
-                        inline else => unreachable,
-                    }
-                    ix = ix + 1;
-                }
+                newParsers[ix] = dropPrefix(p, commonPrefix);
+                ix += 1;
             }
 
-            const select = try Parser.Select(&newParsers);
+            const select = Parser.Select(&newParsers);
             const seq: Parser = .{ .seq = .{ .inner = &.{ Parser.Str(commonPrefix), select }, .handler = .last } };
 
             break :init seq;
         };
     }
 };
+
+fn dropPrefix(comptime parser: Parser, comptime prefix: []const u8) Parser {
+    return comptime build: {
+        switch (parser) {
+            .str => |str| {
+                if (prefix.len > str.ref.len) {
+                    @compileError("Prefix is bigger than reference");
+                }
+                for (prefix, 0..) |p, ix| {
+                    if (str.ref[ix] != p) {
+                        @compileError("Cannot drop prefix");
+                    }
+                }
+
+                break :build .{ .str = .{ .ref = str.ref[prefix.len..], .handler = str.handler } };
+            },
+            .seq => |seq| {
+                var next: [seq.inner.len]Parser = undefined;
+                var cursor = prefix;
+
+                var outerIndex: usize = 0;
+                var innerIndex: usize = 0;
+
+                while (cursor.len > 0) : (outerIndex += 1) {
+                    switch (seq.inner[outerIndex]) {
+                        .str => |istr| {
+                            const innerLen = istr.ref.len;
+
+                            if (innerLen > prefix.len) {
+                                next[innerIndex] = dropPrefix(seq.inner[outerIndex], prefix);
+                                innerIndex += 1;
+                                outerIndex += 1;
+                                break;
+                            } else if (innerLen <= prefix.len) {
+                                cursor = cursor[innerLen..];
+                            }
+                        },
+                        inline else => @compileError("Unsupported splitting on inner parser type"),
+                    }
+                }
+
+                for (outerIndex..seq.inner.len) |ix| {
+                    next[innerIndex] = seq.inner[ix];
+                    innerIndex += 1;
+                }
+
+                const final = next[0..innerIndex].*;
+                return .{ .seq = .{ .inner = &final, .handler = seq.handler } };
+            },
+            inline else => @compileError("Unsupported parser type"),
+        }
+    };
+}
 
 test "Basic parser testing" {
     const testing = std.testing;
@@ -539,41 +544,6 @@ test "Capture parser" {
     };
 }
 
-test "Basic splitting" {
-    const testing = std.testing;
-    const helloworld = comptime Parser.Str("helloworld");
-    const split = try comptime helloworld.split(5);
-    // const hello = comptime Parser.Str("hello", ParseResult.empty);
-    // const world = comptime Parser.Str("world", ParseResult.empty);
-
-    // combining
-    const combined = Parser.Sequence(split[0..]);
-
-    const baseOut = try helloworld.parseRaw("helloworld");
-    const newOut = try combined.parseRaw("helloworld");
-
-    try testing.expectEqualDeep(baseOut.buffer, newOut.buffer);
-}
-
-test "sequence on parser strings concatenate them" {
-    const testing = std.testing;
-    const hello = comptime Parser.Str("hello");
-    const space = comptime Parser.Str(" ");
-    const world = comptime Parser.Str("world");
-
-    const combined = Parser.Sequence(&.{ hello, space, world });
-
-    // The generated parser is a `.str` parser, not a `.seq` parser
-    try switch (combined) {
-        .str => testing.expect(true),
-        inline else => testing.expect(false),
-    };
-
-    const r1 = try combined.parseRaw("hello world");
-
-    try testing.expectEqualDeep(ParseResult{ .bin = "hello world" }, r1.output);
-}
-
 test "select parser" {
     const testing = std.testing;
     const p1 = comptime Parser.Str("alpha");
@@ -582,10 +552,8 @@ test "select parser" {
     const p4 = comptime Parser.Str("delta");
     const p5 = comptime Parser.Str("eta");
     const p6 = comptime Parser.Str("tau");
-    const px = comptime Parser.Str("epsylon");
 
-    try testing.expectError(ParserError.ParserBuildError, Parser.Select(&.{ p5, px }));
-    const select = try Parser.Select(&.{ p1, p2, p3, p4, p5, p6 });
+    const select = Parser.Select(&.{ p1, p2, p3, p4, p5, p6 });
 
     const res1 = try select.parseRaw("alpha");
     try testing.expectEqualStrings("alpha", res1.output.bin);
@@ -601,7 +569,7 @@ test "zip parsers" {
     const p1 = comptime Parser.Str("era");
     const p2 = comptime Parser.Str("engine");
 
-    const glued = comptime try Parser.Zip(&.{ p1, p2 });
+    const glued = comptime Parser.Zip(&.{ p1, p2 });
     const zipped = comptime glued.map(.identity);
 
     var result = try zipped.parseRaw("engine");
@@ -615,7 +583,7 @@ test "putting it all together" {
     const p1 = comptime Parser.Str("era");
     const p2 = comptime Parser.Str("engine");
 
-    const zipped = try Parser.Zip(&.{ p1, p2 });
+    const zipped = Parser.Zip(&.{ p1, p2 });
     const updated: Parser = build: switch (zipped) {
         .seq => |s| {
             const lambda = struct {
@@ -649,60 +617,4 @@ test "repeating parser" {
     }
 
     try testing.expectEqual(3, ix);
-}
-
-fn bench_parser(name: []const u8, parser: *const Parser, data: []const u8, comptime max_loops: usize) !void {
-    var measurements: [max_loops]u64 = [_]u64{0} ** max_loops;
-
-    var loops: usize = 0;
-
-    var timer = try time.Timer.start();
-    while (loops < max_loops) : (loops += 1) {
-        defer measurements[loops] = timer.lap();
-        _ = try parser.parseRaw(data);
-    }
-
-    var smaller = measurements[0];
-    var bigger = measurements[0];
-    var sum: u64 = 0;
-
-    std.mem.sort(u64, &measurements, {}, comptime std.sort.asc(u64));
-
-    for (measurements) |run| {
-        if (run > bigger) {
-            bigger = run;
-        }
-        if (run < smaller) {
-            smaller = run;
-        }
-        sum += run;
-    }
-    const mgn = std.math.log10(sum);
-    const total = sum / std.math.pow(u64, 10, mgn - 1);
-
-    const p50ix = comptime @ceil(0.5 * @as(f32, max_loops));
-    const p90ix = comptime @ceil(0.9 * @as(f32, max_loops));
-    const p99ix = comptime @ceil(0.99 * @as(f32, max_loops));
-
-    const unit = switch (mgn) {
-        1 => "ns",
-        2 => "ns",
-        3 => "ns",
-        4 => "us",
-        5 => "us",
-        6 => "us",
-        7 => "ms",
-        8 => "ms",
-        9 => "ms",
-        else => "s",
-    };
-
-    std.debug.print("{s}: {d} loops\n", .{ name, loops });
-    std.debug.print(" min   {d} ns/op\n", .{smaller});
-    std.debug.print(" max   {d} ns/op\n", .{bigger});
-    std.debug.print(" avg   {d} ns/op\n", .{sum / loops});
-    std.debug.print(" p50   {d} ns/op\n", .{measurements[p50ix]});
-    std.debug.print(" p90   {d} ns/op\n", .{measurements[p90ix]});
-    std.debug.print(" p99   {d} ns/op\n", .{measurements[p99ix]});
-    std.debug.print(" total {d} {s}\n", .{ total, unit });
 }

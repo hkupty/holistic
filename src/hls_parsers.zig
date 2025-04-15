@@ -81,34 +81,38 @@ const handlers = struct {
             }
         }.xk,
     };
+
+    const extversion: parsers.ParseResultMapper = .{ .map = struct {
+        fn handler(state: ParserResult) ParserError!ParserResult {
+            const version = std.fmt.parseInt(u8, state.seq[1].bin, 10) catch |err| {
+                std.debug.print("Failed to parse: {!}", .{err});
+                return ParserError.Mismatch;
+            };
+            return .{ .hls = .{ .Version = .{ .number = version } } };
+        }
+    }.handler };
+
+    const extm3u: parsers.ParseResultMapper = .{ .map = struct {
+        fn handler(_: parsers.ParseResult) ParserError!ParserResult {
+            return .{ .hls = hls.HLSField.EXTM3U };
+        }
+    }.handler };
 };
 
-const extm3u = P.Str("#EXTM3U").map(.{ .map = struct {
-    fn handler(_: parsers.ParseResult) ParserError!ParserResult {
-        return .{ .hls = hls.HLSField.EXTM3U };
-    }
-}.handler });
+const extm3u = P.Str("#EXTM3U").map(handlers.extm3u);
 
-const extversion = P.Sequence(&.{ P.Str("#EXT-X-VERSION:"), P.Capture("") }).map(.{ .map = struct {
-    fn handler(state: ParserResult) ParserError!ParserResult {
-        const version = std.fmt.parseInt(u8, state.seq[1].bin, 10) catch |err| {
-            std.debug.print("Failed to parse: {!}", .{err});
-            return ParserError.Mismatch;
-        };
-        return .{ .hls = .{ .Version = .{ .number = version } } };
-    }
-}.handler });
+const extversion = P.Seq(&.{ P.Str("#EXT-X-VERSION:"), P.Capture("") }).map(handlers.extversion);
 
 const kv = P.Seq(&.{ P.Capture("="), P.MaybeCapture(",") });
 
 const keyattribute = kv.map(handlers.keyattribute);
 
-const extxkey = P.Sequence(&.{
+const extxkey = P.Seq(&.{
     P.Str("#EXT-X-KEY:"),
     P.Repeat(keyattribute, 5),
 }).map(handlers.extkey);
 
-const extinf = P.Sequence(&.{
+const extinf = P.Seq(&.{
     P.Str("#EXTINF:"),
     P.Capture(","),
     P.Capture(""),
@@ -117,7 +121,7 @@ const extinf = P.Sequence(&.{
 const basic_tags = P.Zip(&.{
     extm3u,
     extversion,
-}) catch unreachable;
+});
 
 test "ensure hls parsers work" {
     const testing = std.testing;
