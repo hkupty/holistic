@@ -202,7 +202,7 @@ const SelectParser = struct {
         return parser.parse(state);
     }
 
-    fn peek(_: *const SelectParser) ?u8 {
+    fn peek(_: SelectParser) ?u8 {
         return null;
     }
 
