@@ -293,6 +293,10 @@ const RepeatParser = struct {
             .handler = handler,
         };
     }
+
+    fn peek(self: RepeatParser) ?u8 {
+        return self.inner.peek();
+    }
 };
 
 pub const Parser = union(enum) {
