@@ -37,19 +37,19 @@ pub const ParserError = error{
     Unsupported,
 
     /// Failed to process due to other errors
-    ParserBuildError,
+    Failure,
 };
 
 pub const ParseResultMapper = struct {
     map: *const fn (ParseResult) ParserError!ParseResult,
 
-    const identity: ParseResultMapper = .{ .map = struct {
+    pub const identity: ParseResultMapper = .{ .map = struct {
         fn identity(state: ParseResult) ParserError!ParseResult {
             return state;
         }
     }.identity };
 
-    const last: ParseResultMapper = .{ .map = struct {
+    pub const last: ParseResultMapper = .{ .map = struct {
         fn last(state: ParseResult) ParserError!ParseResult {
             return switch (state) {
                 .seq => |s| s[s.len - 1],
@@ -57,6 +57,15 @@ pub const ParseResultMapper = struct {
             };
         }
     }.last };
+
+    pub const first: ParseResultMapper = .{ .map = struct {
+        fn first(state: ParseResult) ParserError!ParseResult {
+            return switch (state) {
+                .seq => |s| s[0],
+                inline else => state,
+            };
+        }
+    }.first };
 };
 
 pub fn debugParser(parser: Parser) void {
@@ -141,7 +150,7 @@ const StringParser = struct {
                 .output = try self.handler.map(.{ .bin = self.ref }),
             };
         } else {
-            // std.debug.print("Got {s} but it doesn't match {s}\n", .{ target, self.ref });
+            std.debug.print("Got {s} but it doesn't match {s}\n", .{ target, self.ref });
             return ParserError.Mismatch;
         }
     }
@@ -160,6 +169,7 @@ const CaptureParser = struct {
     optional: bool = false,
 
     fn parse(self: CaptureParser, state: ParserState) ParserError!ParserState {
+        std.debug.print("Capture parser w/ terminator {s}\n", .{self.terminator});
         if (self.terminator.len == 0) {
             return captureUntilEOL(state.buffer);
         }
@@ -183,10 +193,13 @@ const CaptureParser = struct {
     }
 };
 
+pub const EOL = Parser.Capture("\n");
+pub const MaybeEOL = Parser.Optional(EOL);
+
 fn captureUntilEOL(input: []const u8) ParserState {
     // TODO: Make this windows-safe... perhaps
     const ix = std.mem.indexOf(u8, input, "\n") orelse input.len;
-
+    // std.debug.print("Got ix of value {d}\n", .{ix});
     return .{ .buffer = input[ix..], .output = .{ .bin = input[0..ix] } };
 }
 
@@ -299,12 +312,44 @@ const RepeatParser = struct {
     }
 };
 
+const OptionalParser = struct {
+    inner: *const Parser,
+    handler: ParseResultMapper = .identity,
+
+    fn parse(self: OptionalParser, state: ParserState) ParserError!ParserState {
+        return self.inner.parse(state) catch |err| {
+            switch (err) {
+                ParserError.Mismatch, ParserError.PrematureEndOfInput => {
+                    std.debug.print("Got a recoverable error '{!}', ignoring\n", .{err});
+                    return state;
+                },
+                inline else => {
+                    std.debug.print("Got an unrecoverable error '{!}', propagating\n", .{err});
+                    return err;
+                },
+            }
+        };
+    }
+
+    fn map(comptime self: OptionalParser, handler: ParseResultMapper) RepeatParser {
+        return .{
+            .inner = self.inner,
+            .handler = handler,
+        };
+    }
+
+    fn peek(self: OptionalParser) ?u8 {
+        return self.inner.peek();
+    }
+};
+
 pub const Parser = union(enum) {
     str: StringParser,
     seq: SequenceParser,
     sel: SelectParser,
     cap: CaptureParser,
     rep: RepeatParser,
+    opt: OptionalParser,
 
     pub fn parseRaw(self: Parser, data: []const u8) ParserError!ParserState {
         return self.parse(.{ .buffer = data, .output = ParseResult.empty });
@@ -319,7 +364,7 @@ pub const Parser = union(enum) {
         };
     }
 
-    fn parse(self: Parser, input: ParserState) ParserError!ParserState {
+    pub fn parse(self: Parser, input: ParserState) ParserError!ParserState {
         return switch (self) {
             inline else => |impl| impl.parse(input),
         };
@@ -362,6 +407,10 @@ pub const Parser = union(enum) {
 
     pub fn Repeat(comptime parser: Parser, times: usize) Parser {
         return .{ .rep = .{ .inner = &parser, .times = times } };
+    }
+
+    pub fn Optional(comptime parser: Parser) Parser {
+        return .{ .opt = .{ .inner = &parser } };
     }
 
     pub fn Zip(comptime parsers: []const Parser) Parser {
@@ -570,6 +619,24 @@ test "repeating parser" {
     var ix: usize = 0;
     for (result.output.seq) |partial| {
         try testing.expectEqualStrings("Yes!", partial.bin);
+        ix += 1;
+    }
+
+    try testing.expectEqual(3, ix);
+}
+
+test "optional parser" {
+    const testing = std.testing;
+    const base = comptime Parser.Str("Yes");
+    const connect = comptime Parser.Str(", ");
+    const maybeConnect = comptime Parser.Optional(connect);
+    const seq = comptime Parser.Seq(&.{ base, maybeConnect });
+    const repeat = comptime Parser.Repeat(seq, 3);
+
+    const result = try repeat.parseRaw("Yes, Yes, Yes");
+    var ix: usize = 0;
+    for (result.output.seq) |partial| {
+        try testing.expectEqualStrings("Yes", partial.seq[0].bin);
         ix += 1;
     }
 

@@ -97,14 +97,20 @@ const handlers = struct {
             return .{ .hls = hls.HLSField.EXTM3U };
         }
     }.handler };
+
+    const extdiscontinuity: parsers.ParseResultMapper = .{ .map = struct {
+        fn handler(_: parsers.ParseResult) ParserError!ParserResult {
+            return .{ .hls = hls.HLSField.Discontinuity };
+        }
+    }.handler };
 };
 
 const extm3u = P.Str("#EXTM3U").map(handlers.extm3u);
+const extdiscontinuity = P.Str("#EXT-X-DISCONTINUITY").map(handlers.extdiscontinuity);
 
 const extversion = P.Seq(&.{ P.Str("#EXT-X-VERSION:"), P.Capture("") }).map(handlers.extversion);
 
 const kv = P.Seq(&.{ P.Capture("="), P.MaybeCapture(",") });
-
 const keyattribute = kv.map(handlers.keyattribute);
 
 const extxkey = P.Seq(&.{
@@ -165,4 +171,50 @@ test "ensure hls parsers work" {
     } } };
 
     try testing.expectEqualDeep(ref, data.output.hls);
+
+    data = try extdiscontinuity.parseRaw("#EXT-X-DISCONTINUITY");
+    try testing.expectEqual(hls.HLSField.Discontinuity, data.output.hls);
+}
+
+const seq = P.Seq(&.{ basic_tags, parsers.MaybeEOL }).map(.first);
+const fullLine = P.Seq(&.{ P.Capture(""), parsers.MaybeEOL }).map(.first);
+
+test "lines" {
+    const testing = std.testing;
+    const small_manifest =
+        \\#EXTM3U
+        \\
+        \\#EXT-X-VERSION:11
+        \\http://some.url/asdf/segment0.ts
+    ;
+
+    const expected = [2]hls.HLSField{
+        hls.HLSField.EXTM3U,
+        .{ .Version = .{ .number = 11 } },
+    };
+
+    var cursor: parsers.ParserState = .{ .buffer = small_manifest, .output = parsers.ParseResult.empty };
+
+    var ix: u8 = 0;
+    const max_lines = std.mem.count(u8, small_manifest, "\n");
+    var lines: usize = 0;
+    while (cursor.buffer.len > 0) : (lines += 1) {
+        cursor = seq.parse(cursor) catch |err| val: {
+            std.debug.print("Got error {!}. Falling back to EOL. Current buffer: {s}\n", .{ err, cursor.buffer });
+            break :val try fullLine.parse(cursor);
+        };
+
+        switch (cursor.output) {
+            .hls => |field| {
+                std.debug.print("Got field {!}\n", .{field});
+                try testing.expectEqual(expected[ix], field);
+                ix += 1;
+            },
+            .bin => try testing.expect(true),
+            inline else => try testing.expect(false),
+        }
+
+        try testing.expect(ix <= 2);
+        try testing.expect(lines <= max_lines);
+    }
 }
