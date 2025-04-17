@@ -108,7 +108,7 @@ const handlers = struct {
 const extm3u = P.Str("#EXTM3U").map(handlers.extm3u);
 const extdiscontinuity = P.Str("#EXT-X-DISCONTINUITY").map(handlers.extdiscontinuity);
 
-const extversion = P.Seq(&.{ P.Str("#EXT-X-VERSION:"), P.Capture("") }).map(handlers.extversion);
+const extversion = P.Seq(&.{ P.Str("#EXT-X-VERSION:"), parsers.Remaining }).map(handlers.extversion);
 
 const kv = P.Seq(&.{ P.Capture("="), P.MaybeCapture(",") });
 const keyattribute = kv.map(handlers.keyattribute);
@@ -121,7 +121,7 @@ const extxkey = P.Seq(&.{
 const extinf = P.Seq(&.{
     P.Str("#EXTINF:"),
     P.Capture(","),
-    P.Capture(""),
+    parsers.Remaining,
 }).map(handlers.extinf);
 
 const basic_tags = P.Zip(&.{
@@ -177,7 +177,7 @@ test "ensure hls parsers work" {
 }
 
 const seq = P.Seq(&.{ basic_tags, parsers.MaybeEOL }).map(.first);
-const fullLine = P.Seq(&.{ P.Capture(""), parsers.MaybeEOL }).map(.first);
+const fullLine = P.Seq(&.{ parsers.Remaining, parsers.MaybeEOL }).map(.first);
 
 test "lines" {
     const testing = std.testing;

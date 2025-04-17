@@ -195,6 +195,7 @@ const CaptureParser = struct {
 
 pub const EOL = Parser.Capture("\n");
 pub const MaybeEOL = Parser.Optional(EOL);
+pub const Remaining = Parser.Capture("");
 
 fn captureUntilEOL(input: []const u8) ParserState {
     // TODO: Make this windows-safe... perhaps
