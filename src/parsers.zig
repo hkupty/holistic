@@ -331,7 +331,7 @@ const OptionalParser = struct {
         };
     }
 
-    fn map(comptime self: OptionalParser, handler: ParseResultMapper) RepeatParser {
+    fn map(comptime self: OptionalParser, handler: ParseResultMapper) OptionalParser {
         return .{
             .inner = self.inner,
             .handler = handler,
