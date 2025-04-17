@@ -27,15 +27,73 @@ Consider the following HLS tags:
 #EXTINF
 ```
 
-These are some of many tags that exist in the HLS spec.
+This could be "zipped" (for the lack of a better term, sorry) into the following structure:
 
-Note anything similar? Well, all of them have a shared prefix. And a few of them share some sections of the tag as well.
+```
+#EXT
+   ├ M3U
+   ├ INF
+   └ -X-
+       ├ VERSION
+       ├ START
+       └ PROGRAM-DATE-TIME
+```
 
-This means that we could, in theory, combine parsers by their shared prefix and efficiently route the input to the correct parser. The `efficiently` part is the key here, which I believe `comptime` is a great solution for.
+Then, if we look at the first character of each subsequent tag below `#EXT`:
+```
+M   01001101
+I   01001001
+-   00101101
+```
+
+Intuitively, we can see that `chr >> 2 & 0b1111` results in an unique number for each character that can give us an index to an array:
+```
+M 3
+I 2
+- 11
+```
+
+Calculating the shift and the mask, however, is a computationally expensive operation as computers don't operate on intuition, but we can compute them
+on compile time if we know (and we do) during compilation which parsers we want to zip together.
+This then can serve as an optimized no-clash hashing algorithm, specially crafted at compile time, to efficiently select the right parser for the right tag.
 
 ## Cool, have you solved it?
 
-Not yet. This is, as I said, my playground for learning zig and I want to put my theory to the test with it.
+It is going well, but nowhere near done yet.
+
+So far, this is the best working example I have:
+```zig
+const extm3u = Parser.Str("#EXTM3U").map(handlers.extm3u);
+const extversion = Parser.Seq(&.{ Parser.Str("#EXT-X-VERSION:"), parsers.Remaining }).map(handlers.extversion);
+const basic_tags = Parser.Zip(&.{
+    extm3u,
+    extversion,
+});
+const seq = Parser.Seq(&.{ basic_tags, parsers.MaybeEOL }).map(.first);
+const fullLine = Parser.Seq(&.{ parsers.Remaining, parsers.MaybeEOL }).map(.first);
+const small_manifest =
+    \\#EXTM3U
+    \\
+    \\#EXT-X-VERSION:11
+    ;
+
+var cursor: parsers.ParserState = .{ .buffer = small_manifest, .output = parsers.ParseResult.empty };
+
+while (cursor.buffer.len > 0) {
+    cursor = seq.parse(cursor) catch |err| val: {
+        std.debug.print("Got error {!}. Falling back to EOL. Current buffer: {s}\n", .{ err, cursor.buffer });
+        break :val try fullLine.parse(cursor);
+    };
+    swtich(cursor.output) {
+        .hls => // Do something with the parsed manifest data
+        .bin => // Handle empty lines or URLS in from the manifest
+        inline else => unreachable
+    }
+}
+```
+
+
+This is, as I said, my playground for learning zig and I want to put my theory to the test with it.
 
 If I succeed, awesome, maybe this becomes a real library someday;
 If I fail successfully, I learn something in the process;
@@ -43,8 +101,7 @@ If I fail catastrophically, then I should take a step back, reassess, and learn 
 
 Therefore, there's always a win hidden somewhere. The only time I lose is if I get stuck. Let's make sure this doesn't happen.
 
-
-## Where am I at and how can you (yes, you reading this) help?
+## Where are you and how can I (yes, you reading this) help?
 
 I have picked up a few things already and this is starting to feel natural, which is good.
 At the same time, this is a one-person journey and there's a risk I'm piling up vices, anti-patterns or suboptimal ways of solving problems.
