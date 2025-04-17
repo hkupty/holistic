@@ -46,7 +46,7 @@ I   01001001
 -   00101101
 ```
 
-Intuitively, we can see that `chr >> 2 & 0b1111` results in an unique number for each character that can give us an index to an array:
+Intuitively, we can see that `chr >> 2 & 0b1111` results in an unique small number for each character that can give us an index to an array:
 ```
 M 3
 I 2
