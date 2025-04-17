@@ -185,7 +185,7 @@ const CaptureParser = struct {
             };
         };
 
-        return .{ .buffer = state.buffer[ix + 1 ..], .output = .{ .bin = state.buffer[0..ix] } };
+        return .{ .buffer = state.buffer[ix + self.terminator.len ..], .output = .{ .bin = state.buffer[0..ix] } };
     }
 
     fn peek(_: CaptureParser) ?u8 {
